@@ -1,0 +1,830 @@
+[33m  1[39m          /* SPDX-License-Identifier: GPL-2.0 */
+[33m  2[39m          #include <linux/mount.h>
+[33m  3[39m          #include <linux/seq_file.h>
+[33m  4[39m          #include <linux/poll.h>
+[33m  5[39m          #include <linux/ns_common.h>
+[33m  6[39m          #include <linux/fs_pin.h>
+[33m  7[39m          
+[33m  8[39m          struct mnt_namespace {
+[33m  9[39m          	struct ns_common	ns;
+[33m 10[39m          	struct mount *	root;
+[33m 11[39m          	struct rb_root		mounts; /* Protected by namespace_sem */
+[33m 12[39m          	struct user_namespace	*user_ns;
+[33m 13[39m          	struct ucounts		*ucounts;
+[33m 14[39m          	u64			seq;	/* Sequence number to prevent loops */
+[33m 15[39m          	wait_queue_head_t poll;
+[33m 16[39m          	u64 event;
+[33m 17[39m          	unsigned int		nr_mounts; /* # of mounts in the namespace */
+[33m 18[39m          	unsigned int		pending_mounts;
+[33m 19[39m          } __randomize_layout;
+[33m 20[39m          
+[33m 21[39m          struct mnt_pcp {
+[33m 22[39m          	int mnt_count;
+[33m 23[39m          	int mnt_writers;
+[33m 24[39m          };
+[33m 25[39m          
+[33m 26[39m          struct mountpoint {
+[33m 27[39m          	struct hlist_node m_hash;
+[33m 28[39m          	struct dentry *m_dentry;
+[33m 29[39m          	struct hlist_head m_list;
+[33m 30[39m          	int m_count;
+[33m 31[39m          };
+[33m 32[39m          
+[33m 33[39m          struct mount {
+[33m 34[39m          	struct hlist_node mnt_hash;
+[33m 35[39m          	struct mount *mnt_parent;
+[33m 36[39m          	struct dentry *mnt_mountpoint;
+[33m 37[39m          	struct vfsmount mnt;
+[33m 38[39m          	union {
+[33m 39[39m          		struct rcu_head mnt_rcu;
+[33m 40[39m          		struct llist_node mnt_llist;
+[33m 41[39m          	};
+[33m 42[39m          #ifdef CONFIG_SMP
+[33m 43[39m          	struct mnt_pcp __percpu *mnt_pcp;
+[33m 44[39m          #else
+[33m 45[39m          	int mnt_count;
+[33m 46[39m          	int mnt_writers;
+[33m 47[39m          #endif
+[33m 48[39m          	struct list_head mnt_mounts;	/* list of children, anchored here */
+[33m 49[39m          	struct list_head mnt_child;	/* and going through their mnt_child */
+[33m 50[39m          	struct list_head mnt_instance;	/* mount instance on sb->s_mounts */
+[33m 51[39m          	const char *mnt_devname;	/* Name of device e.g. /dev/dsk/hda1 */
+[33m 52[39m          	union {
+[33m 53[39m          		struct rb_node mnt_node;	/* Under ns->mounts */
+[33m 54[39m          		struct list_head mnt_list;
+[33m 55[39m          	};
+[33m 56[39m          	struct list_head mnt_expire;	/* link in fs-specific expiry list */
+[33m 57[39m          	struct list_head mnt_share;	/* circular list of shared mounts */
+[33m 58[39m          	struct list_head mnt_slave_list;/* list of slave mounts */
+[33m 59[39m          	struct list_head mnt_slave;	/* slave list entry */
+[33m 60[39m          	struct mount *mnt_master;	/* slave is on master->mnt_slave_list */
+[33m 61[39m          	struct mnt_namespace *mnt_ns;	/* containing namespace */
+[33m 62[39m          	struct mountpoint *mnt_mp;	/* where is it mounted */
+[33m 63[39m          	union {
+[33m 64[39m          		struct hlist_node mnt_mp_list;	/* list mounts with the same mountpoint */
+[33m 65[39m          		struct hlist_node mnt_umount;
+[33m 66[39m          	};
+[33m 67[39m          	struct list_head mnt_umounting; /* list entry for umount propagation */
+[33m 68[39m          #ifdef CONFIG_FSNOTIFY
+[33m 69[39m          	struct fsnotify_mark_connector __rcu *mnt_fsnotify_marks;
+[33m 70[39m          	__u32 mnt_fsnotify_mask;
+[33m 71[39m          #endif
+[33m 72[39m          	int mnt_id;			/* mount identifier, reused */
+[33m 73[39m          	u64 mnt_id_unique;		/* mount ID unique until reboot */
+[33m 74[39m          	int mnt_group_id;		/* peer group identifier */
+[33m 75[39m          	int mnt_expiry_mark;		/* true if marked for expiry */
+[33m 76[39m          	struct hlist_head mnt_pins;
+[33m 77[39m          	struct hlist_head mnt_stuck_children;
+[33m 78[39m          } __randomize_layout;
+[33m 79[39m          
+[33m 80[39m          #define MNT_NS_INTERNAL ERR_PTR(-EINVAL) /* distinct from any mnt_namespace */
+[33m 81[39m          
+[33m 82[39m [31mffffffff817799e0[39m static inline struct mount *real_mount(struct vfsmount *mnt)
+    [31mffffffff8178acfb[39m 
+    [31mffffffff8178aef4[39m 
+    [31mffffffff817ce2fc[39m 
+    [31mffffffff817ce633[39m 
+    [31mffffffff817d0079[39m 
+    [31mffffffff817d075e[39m 
+    [31mffffffff817d0e05[39m 
+    [31mffffffff817d1c1f[39m 
+    [31mffffffff817d2b03[39m 
+    [31mffffffff817d2c3f[39m 
+    [31mffffffff817d3244[39m 
+    [31mffffffff817d4197[39m 
+    [31mffffffff817d4cf1[39m 
+    [31mffffffff817d5c64[39m 
+    [31mffffffff817d6fee[39m 
+    [31mffffffff817d748a[39m 
+    [31mffffffff817d8fc1[39m 
+    [31mffffffff817d9401[39m 
+    [31mffffffff817d953e[39m 
+    [31mffffffff817d98ac[39m 
+    [31mffffffff817da077[39m 
+    [31mffffffff817da3bc[39m 
+    [31mffffffff817dbb77[39m 
+    [31mffffffff817dbeae[39m 
+    [31mffffffff817dbed5[39m 
+    [31mffffffff817dc6e9[39m 
+    [31mffffffff817de448[39m 
+    [31mffffffff817df421[39m 
+    [31mffffffff817df5bf[39m 
+    [31mffffffff817df75d[39m 
+    [31mffffffff817dfcb6[39m 
+    [31mffffffff817e0135[39m 
+    [31mffffffff817e0ad0[39m 
+    [31mffffffff817e0b43[39m 
+    [31mffffffff817e1e82[39m 
+    [31mffffffff817e1e8e[39m 
+    [31mffffffff817e1eb2[39m 
+    [31mffffffff817e3909[39m 
+    [31mffffffff817e3a60[39m 
+    [31mffffffff85efd645[39m 
+    [31mffffffff818202e5[39m 
+    [31mffffffff818443ea[39m 
+[33m 83[39m          {
+[33m 84[39m [31mffffffff817799e0[39m 	return container_of(mnt, struct mount, mnt);
+    [31mffffffff817799e0[39m 
+    [31mffffffff817799e0[39m 
+    [31mffffffff817799e0[39m 
+    [31mffffffff817799fa[39m 
+    [31mffffffff817799fe[39m 
+    [31mffffffff8178acfb[39m 
+    [31mffffffff8178acfb[39m 
+    [31mffffffff8178acfb[39m 
+    [31mffffffff8178acfb[39m 
+    [31mffffffff8178ad05[39m 
+    [31mffffffff8178aef4[39m 
+    [31mffffffff8178aef4[39m 
+    [31mffffffff8178aef4[39m 
+    [31mffffffff8178aef4[39m 
+    [31mffffffff8178aef4[39m 
+    [31mffffffff8178aef9[39m 
+    [31mffffffff817ce2fc[39m 
+    [31mffffffff817ce2fc[39m 
+    [31mffffffff817ce2fc[39m 
+    [31mffffffff817ce2fc[39m 
+    [31mffffffff817ce2fc[39m 
+    [31mffffffff817ce301[39m 
+    [31mffffffff817ce633[39m 
+    [31mffffffff817ce633[39m 
+    [31mffffffff817ce633[39m 
+    [31mffffffff817ce633[39m 
+    [31mffffffff817ce63b[39m 
+    [31mffffffff817ce63f[39m 
+    [31mffffffff817d0079[39m 
+    [31mffffffff817d0079[39m 
+    [31mffffffff817d0079[39m 
+    [31mffffffff817d0079[39m 
+    [31mffffffff817d0079[39m 
+    [31mffffffff817d0279[39m 
+    [31mffffffff817d075e[39m 
+    [31mffffffff817d075e[39m 
+    [31mffffffff817d075e[39m 
+    [31mffffffff817d075e[39m 
+    [31mffffffff817d076b[39m 
+    [31mffffffff817d076f[39m 
+    [31mffffffff817d0e05[39m 
+    [31mffffffff817d0e05[39m 
+    [31mffffffff817d0e05[39m 
+    [31mffffffff817d0e05[39m 
+    [31mffffffff817d0e05[39m 
+    [31mffffffff817d0e76[39m 
+    [31mffffffff817d1c1f[39m 
+    [31mffffffff817d1c1f[39m 
+    [31mffffffff817d1c1f[39m 
+    [31mffffffff817d1c1f[39m 
+    [31mffffffff817d1c28[39m 
+    [31mffffffff817d2b03[39m 
+    [31mffffffff817d2b03[39m 
+    [31mffffffff817d2b03[39m 
+    [31mffffffff817d2b03[39m 
+    [31mffffffff817d2b0f[39m 
+    [31mffffffff817d2b13[39m 
+    [31mffffffff817d2c3f[39m 
+    [31mffffffff817d2c3f[39m 
+    [31mffffffff817d2c3f[39m 
+    [31mffffffff817d2c3f[39m 
+    [31mffffffff817d2c4b[39m 
+    [31mffffffff817d2c4f[39m 
+    [31mffffffff817d323b[39m 
+    [31mffffffff817d3244[39m 
+    [31mffffffff817d3244[39m 
+    [31mffffffff817d3244[39m 
+    [31mffffffff817d3244[39m 
+    [31mffffffff817d3244[39m 
+    [31mffffffff817d4197[39m 
+    [31mffffffff817d4197[39m 
+    [31mffffffff817d4197[39m 
+    [31mffffffff817d4197[39m 
+    [31mffffffff817d41a7[39m 
+    [31mffffffff817d41ac[39m 
+    [31mffffffff817d4cf1[39m 
+    [31mffffffff817d4cf1[39m 
+    [31mffffffff817d4cf1[39m 
+    [31mffffffff817d4cf1[39m 
+    [31mffffffff817d4cf5[39m 
+    [31mffffffff817d4cfa[39m 
+    [31mffffffff817d5c64[39m 
+    [31mffffffff817d5c64[39m 
+    [31mffffffff817d5c64[39m 
+    [31mffffffff817d5c64[39m 
+    [31mffffffff817d5c71[39m 
+    [31mffffffff817d5c76[39m 
+    [31mffffffff817d6fee[39m 
+    [31mffffffff817d6fee[39m 
+    [31mffffffff817d6fee[39m 
+    [31mffffffff817d6fee[39m 
+    [31mffffffff817d6fee[39m 
+    [31mffffffff817d6ff7[39m 
+    [31mffffffff817d748a[39m 
+    [31mffffffff817d748a[39m 
+    [31mffffffff817d748a[39m 
+    [31mffffffff817d748a[39m 
+    [31mffffffff817d748e[39m 
+    [31mffffffff817d7492[39m 
+    [31mffffffff817d7496[39m 
+    [31mffffffff817d7ba9[39m 
+    [31mffffffff817d7bad[39m 
+    [31mffffffff817d7cf0[39m 
+    [31mffffffff817d7cf3[39m 
+    [31mffffffff817d8fc1[39m 
+    [31mffffffff817d8fc1[39m 
+    [31mffffffff817d8fc1[39m 
+    [31mffffffff817d8fc1[39m 
+    [31mffffffff817d8fc1[39m 
+    [31mffffffff817d90c4[39m 
+    [31mffffffff817d9401[39m 
+    [31mffffffff817d9401[39m 
+    [31mffffffff817d9401[39m 
+    [31mffffffff817d9401[39m 
+    [31mffffffff817d9401[39m 
+    [31mffffffff817d9405[39m 
+    [31mffffffff817d953e[39m 
+    [31mffffffff817d953e[39m 
+    [31mffffffff817d953e[39m 
+    [31mffffffff817d953e[39m 
+    [31mffffffff817d9543[39m 
+    [31mffffffff817d98ac[39m 
+    [31mffffffff817d98ac[39m 
+    [31mffffffff817d98ac[39m 
+    [31mffffffff817d98ac[39m 
+    [31mffffffff817d98b8[39m 
+    [31mffffffff817d98bc[39m 
+    [31mffffffff817da077[39m 
+    [31mffffffff817da077[39m 
+    [31mffffffff817da077[39m 
+    [31mffffffff817da077[39m 
+    [31mffffffff817da07c[39m 
+    [31mffffffff817da084[39m 
+    [31mffffffff817da08d[39m 
+    [31mffffffff817da3bc[39m 
+    [31mffffffff817da3bc[39m 
+    [31mffffffff817da3bc[39m 
+    [31mffffffff817da3bc[39m 
+    [31mffffffff817da3bc[39m 
+    [31mffffffff817da3be[39m 
+    [31mffffffff817dbb77[39m 
+    [31mffffffff817dbb77[39m 
+    [31mffffffff817dbb77[39m 
+    [31mffffffff817dbb77[39m 
+    [31mffffffff817dbb8a[39m 
+    [31mffffffff817dbb8e[39m 
+    [31mffffffff817dbeae[39m 
+    [31mffffffff817dbeae[39m 
+    [31mffffffff817dbeae[39m 
+    [31mffffffff817dbeae[39m 
+    [31mffffffff817dbeae[39m 
+    [31mffffffff817dbed5[39m 
+    [31mffffffff817dbed5[39m 
+    [31mffffffff817dbed5[39m 
+    [31mffffffff817dbed5[39m 
+    [31mffffffff817dbed5[39m 
+    [31mffffffff817dc0cc[39m 
+    [31mffffffff817dc0da[39m 
+    [31mffffffff817dc307[39m 
+    [31mffffffff817dc315[39m 
+    [31mffffffff817dc6e9[39m 
+    [31mffffffff817dc6e9[39m 
+    [31mffffffff817dc6e9[39m 
+    [31mffffffff817dc6e9[39m 
+    [31mffffffff817dc6e9[39m 
+    [31mffffffff817dc6f9[39m 
+    [31mffffffff817dcc54[39m 
+    [31mffffffff817dcc5b[39m 
+    [31mffffffff817de448[39m 
+    [31mffffffff817de448[39m 
+    [31mffffffff817de448[39m 
+    [31mffffffff817de448[39m 
+    [31mffffffff817de451[39m 
+    [31mffffffff817df421[39m 
+    [31mffffffff817df421[39m 
+    [31mffffffff817df421[39m 
+    [31mffffffff817df421[39m 
+    [31mffffffff817df421[39m 
+    [31mffffffff817df5bf[39m 
+    [31mffffffff817df5bf[39m 
+    [31mffffffff817df5bf[39m 
+    [31mffffffff817df5bf[39m 
+    [31mffffffff817df5bf[39m 
+    [31mffffffff817df75d[39m 
+    [31mffffffff817df75d[39m 
+    [31mffffffff817df75d[39m 
+    [31mffffffff817df75d[39m 
+    [31mffffffff817df75d[39m 
+    [31mffffffff817dfa5d[39m 
+    [31mffffffff817dfa6f[39m 
+    [31mffffffff817dfa73[39m 
+    [31mffffffff817dfcb6[39m 
+    [31mffffffff817dfcb6[39m 
+    [31mffffffff817dfcb6[39m 
+    [31mffffffff817dfcb6[39m 
+    [31mffffffff817dfcba[39m 
+    [31mffffffff817dff41[39m 
+    [31mffffffff817e00b7[39m 
+    [31mffffffff817e00bc[39m 
+    [31mffffffff817e0135[39m 
+    [31mffffffff817e0135[39m 
+    [31mffffffff817e0135[39m 
+    [31mffffffff817e0135[39m 
+    [31mffffffff817e0141[39m 
+    [31mffffffff817e0145[39m 
+    [31mffffffff817e0ad0[39m 
+    [31mffffffff817e0ad0[39m 
+    [31mffffffff817e0ad0[39m 
+    [31mffffffff817e0ad0[39m 
+    [31mffffffff817e0adc[39m 
+    [31mffffffff817e0ae0[39m 
+    [31mffffffff817e0b43[39m 
+    [31mffffffff817e0b43[39m 
+    [31mffffffff817e0b43[39m 
+    [31mffffffff817e0b43[39m 
+    [31mffffffff817e0b4f[39m 
+    [31mffffffff817e0b53[39m 
+    [31mffffffff817e1e82[39m 
+    [31mffffffff817e1e82[39m 
+    [31mffffffff817e1e82[39m 
+    [31mffffffff817e1e82[39m 
+    [31mffffffff817e1e82[39m 
+    [31mffffffff817e1e8e[39m 
+    [31mffffffff817e1e8e[39m 
+    [31mffffffff817e1e8e[39m 
+    [31mffffffff817e1e8e[39m 
+    [31mffffffff817e1e8e[39m 
+    [31mffffffff817e1eb2[39m 
+    [31mffffffff817e1eb2[39m 
+    [31mffffffff817e1eb2[39m 
+    [31mffffffff817e1eb2[39m 
+    [31mffffffff817e1eb2[39m 
+    [31mffffffff817e215e[39m 
+    [31mffffffff817e217f[39m 
+    [31mffffffff817e2188[39m 
+    [31mffffffff817e38be[39m 
+    [31mffffffff817e3909[39m 
+    [31mffffffff817e3909[39m 
+    [31mffffffff817e3909[39m 
+    [31mffffffff817e3909[39m 
+    [31mffffffff817e390e[39m 
+    [31mffffffff817e3a60[39m 
+    [31mffffffff817e3a60[39m 
+    [31mffffffff817e3a60[39m 
+    [31mffffffff817e3a60[39m 
+    [31mffffffff817e3a6d[39m 
+    [31mffffffff817e3a72[39m 
+    [31mffffffff85efd645[39m 
+    [31mffffffff85efd645[39m 
+    [31mffffffff85efd645[39m 
+    [31mffffffff85efd645[39m 
+    [31mffffffff85efd64a[39m 
+    [31mffffffff85efd64e[39m 
+    [31mffffffff85efd652[39m 
+    [31mffffffff818202e5[39m 
+    [31mffffffff818202e5[39m 
+    [31mffffffff818202e5[39m 
+    [31mffffffff818202e5[39m 
+    [31mffffffff818202f6[39m 
+    [31mffffffff818443ea[39m 
+    [31mffffffff818443ea[39m 
+    [31mffffffff818443ea[39m 
+    [31mffffffff818443ea[39m 
+    [31mffffffff818443ea[39m 
+    [31mffffffff818446b1[39m 
+[33m 85[39m          }
+[33m 86[39m          
+[33m 87[39m [31mffffffff817792b3[39m static inline int mnt_has_parent(struct mount *mnt)
+    [31mffffffff817cd815[39m 
+    [31mffffffff817cd9e5[39m 
+    [31mffffffff817cd9f4[39m 
+    [31mffffffff817ce66a[39m 
+    [31mffffffff817d07b1[39m 
+    [31mffffffff817d1c55[39m 
+    [31mffffffff817d1d52[39m 
+    [31mffffffff817d42f7[39m 
+    [31mffffffff817dc6a2[39m 
+    [31mffffffff817dcc6c[39m 
+    [31mffffffff817e1af0[39m 
+[33m 88[39m          {
+[33m 89[39m [31mffffffff8177926b[39m 	return mnt != mnt->mnt_parent;
+    [31mffffffff817792b3[39m 
+    [31mffffffff817792b3[39m 
+    [31mffffffff817792cd[39m 
+    [31mffffffff817792d1[39m 
+    [31mffffffff81779472[39m 
+    [31mffffffff8177947c[39m 
+    [31mffffffff817cd7be[39m 
+    [31mffffffff817cd7ca[39m 
+    [31mffffffff817cd7e0[39m 
+    [31mffffffff817cd7e4[39m 
+    [31mffffffff817cd815[39m 
+    [31mffffffff817cd815[39m 
+    [31mffffffff817cd9e5[39m 
+    [31mffffffff817cd9e5[39m 
+    [31mffffffff817cd9f4[39m 
+    [31mffffffff817cd9f4[39m 
+    [31mffffffff817cdbeb[39m 
+    [31mffffffff817cdbf8[39m 
+    [31mffffffff817ce645[39m 
+    [31mffffffff817ce66a[39m 
+    [31mffffffff817ce66a[39m 
+    [31mffffffff817ce685[39m 
+    [31mffffffff817ce689[39m 
+    [31mffffffff817ce709[39m 
+    [31mffffffff817ce713[39m 
+    [31mffffffff817d0788[39m 
+    [31mffffffff817d07b1[39m 
+    [31mffffffff817d07b1[39m 
+    [31mffffffff817d07cc[39m 
+    [31mffffffff817d07d0[39m 
+    [31mffffffff817d163b[39m 
+    [31mffffffff817d1645[39m 
+    [31mffffffff817d1c28[39m 
+    [31mffffffff817d1c55[39m 
+    [31mffffffff817d1c55[39m 
+    [31mffffffff817d1c70[39m 
+    [31mffffffff817d1c74[39m 
+    [31mffffffff817d1d52[39m 
+    [31mffffffff817d1d52[39m 
+    [31mffffffff817d1d6d[39m 
+    [31mffffffff817d1d71[39m 
+    [31mffffffff817d20b4[39m 
+    [31mffffffff817d20be[39m 
+    [31mffffffff817d20db[39m 
+    [31mffffffff817d20e5[39m 
+    [31mffffffff817d42f7[39m 
+    [31mffffffff817d42f7[39m 
+    [31mffffffff817d4320[39m 
+    [31mffffffff817d4c9e[39m 
+    [31mffffffff817d4ca8[39m 
+    [31mffffffff817dc685[39m 
+    [31mffffffff817dc691[39m 
+    [31mffffffff817dc6a2[39m 
+    [31mffffffff817dc6a2[39m 
+    [31mffffffff817dc6c0[39m 
+    [31mffffffff817dcc6c[39m 
+    [31mffffffff817dcc6c[39m 
+    [31mffffffff817dcc96[39m 
+    [31mffffffff817dcf10[39m 
+    [31mffffffff817dcf1a[39m 
+    [31mffffffff817dcf3e[39m 
+    [31mffffffff817dcf48[39m 
+    [31mffffffff817e1acb[39m 
+    [31mffffffff817e1af0[39m 
+    [31mffffffff817e1af0[39m 
+    [31mffffffff817e1b07[39m 
+    [31mffffffff817e1b0b[39m 
+    [31mffffffff817e1b7f[39m 
+    [31mffffffff817e1b86[39m 
+[33m 90[39m          }
+[33m 91[39m          
+[33m 92[39m [31mffffffff817cbc0d[39m static inline int is_mounted(struct vfsmount *mnt)
+    [31mffffffff817d42a5[39m 
+    [31mffffffff817d5f34[39m 
+    [31mffffffff817dc0a7[39m 
+    [31mffffffff817dd320[39m 
+    [31mffffffff817dd368[39m 
+[33m 93[39m          {
+[33m 94[39m          	/* neither detached nor internal? */
+[33m 95[39m [31mffffffff817cbbff[39m 	return !IS_ERR_OR_NULL(real_mount(mnt)->mnt_ns);
+    [31mffffffff817cbc0d[39m 
+    [31mffffffff817cbc0d[39m 
+    [31mffffffff817cbc28[39m 
+    [31mffffffff817cbd51[39m 
+    [31mffffffff817cbd5b[39m 
+    [31mffffffff817d42a5[39m 
+    [31mffffffff817d42a5[39m 
+    [31mffffffff817d4c71[39m 
+    [31mffffffff817d4c80[39m 
+    [31mffffffff817d5f34[39m 
+    [31mffffffff817d5f34[39m 
+    [31mffffffff817d5f4e[39m 
+    [31mffffffff817d6150[39m 
+    [31mffffffff817d615a[39m 
+    [31mffffffff817dc0a7[39m 
+    [31mffffffff817dd320[39m 
+    [31mffffffff817dd320[39m 
+    [31mffffffff817dd368[39m 
+    [31mffffffff817dd368[39m 
+    [31mffffffff817dd374[39m 
+    [31mffffffff817dd38f[39m 
+    [31mffffffff817ddaba[39m 
+    [31mffffffff817ddac7[39m 
+    [31mffffffff817ddad1[39m 
+[33m 96[39m          }
+[33m 97[39m          
+[33m 98[39m          extern struct mount *__lookup_mnt(struct vfsmount *, struct dentry *);
+[33m 99[39m          
+[33m100[39m          extern int __legitimize_mnt(struct vfsmount *, unsigned);
+[33m101[39m          
+[33m102[39m [31mffffffff817ab7ff[39m static inline bool __path_is_mountpoint(const struct path *path)
+    [31mffffffff817d5a9a[39m 
+[33m103[39m          {
+[33m104[39m [31mffffffff817ab7ff[39m 	struct mount *m = __lookup_mnt(path->mnt, path->dentry);
+    [31mffffffff817ab7ff[39m 
+    [31mffffffff817d5a9a[39m 
+    [31mffffffff817d5a9a[39m 
+[33m105[39m [31mffffffff817ab812[39m 	return m && likely(!(m->mnt.mnt_flags & MNT_SYNC_UMOUNT));
+    [31mffffffff817ab812[39m 
+    [31mffffffff817ab817[39m 
+    [31mffffffff817ab81c[39m 
+    [31mffffffff817ab842[39m 
+    [31mffffffff817ab848[39m 
+    [31mffffffff817d5aa9[39m 
+    [31mffffffff817d5aa9[39m 
+    [31mffffffff817d5ab3[39m 
+    [31mffffffff817d5ab8[39m 
+    [31mffffffff817d5ad6[39m 
+    [31mffffffff817d5ae6[39m 
+    [31mffffffff817d5b3d[39m 
+[33m106[39m          }
+[33m107[39m          
+[33m108[39m          extern void __detach_mounts(struct dentry *dentry);
+[33m109[39m          
+[33m110[39m [31mffffffff81780e3b[39m static inline void detach_mounts(struct dentry *dentry)
+    [31mffffffff81781d57[39m 
+    [31mffffffff81785e87[39m 
+    [31mffffffff817b1ff0[39m 
+[33m111[39m          {
+[33m112[39m [31mffffffff81780e3b[39m 	if (!d_mountpoint(dentry))
+    [31mffffffff81780e60[39m 
+    [31mffffffff81780e6d[39m 
+    [31mffffffff81781d57[39m 
+    [31mffffffff81781d78[39m 
+    [31mffffffff81781d84[39m 
+    [31mffffffff81785e87[39m 
+    [31mffffffff81785ea9[39m 
+    [31mffffffff817b1ff0[39m 
+    [31mffffffff817b200d[39m 
+[33m113[39m          		return;
+[33m114[39m [31mffffffff81780fde[39m 	__detach_mounts(dentry);
+    [31mffffffff81780feb[39m 
+    [31mffffffff8178218d[39m 
+    [31mffffffff8178219a[39m 
+    [31mffffffff81785eb2[39m 
+    [31mffffffff81785ebf[39m 
+    [31mffffffff817b2016[39m 
+[33m115[39m          }
+[33m116[39m          
+[33m117[39m [31mffffffff817cdfcc[39m static inline void get_mnt_ns(struct mnt_namespace *ns)
+    [31mffffffff817e0687[39m 
+    [31mffffffff817e3d66[39m 
+    [31mffffffff85efd6f0[39m 
+    [31mffffffff8184548d[39m 
+[33m118[39m          {
+[33m119[39m [31mffffffff817cdfcc[39m 	refcount_inc(&ns->ns.count);
+    [31mffffffff817cdfd6[39m 
+    [31mffffffff817e0687[39m 
+    [31mffffffff817e3d66[39m 
+    [31mffffffff85efd6f0[39m 
+    [31mffffffff8184548d[39m 
+    [31mffffffff818454a4[39m 
+[33m120[39m          }
+[33m121[39m          
+[33m122[39m          extern seqlock_t mount_lock;
+[33m123[39m          
+[33m124[39m          struct proc_mounts {
+[33m125[39m          	struct mnt_namespace *ns;
+[33m126[39m          	struct path root;
+[33m127[39m          	int (*show)(struct seq_file *, struct vfsmount *);
+[33m128[39m          };
+[33m129[39m          
+[33m130[39m          extern const struct seq_operations mounts_op;
+[33m131[39m          
+[33m132[39m          extern bool __is_local_mountpoint(struct dentry *dentry);
+[33m133[39m [31mffffffff81780bce[39m static inline bool is_local_mountpoint(struct dentry *dentry)
+    [31mffffffff81781b41[39m 
+    [31mffffffff8178544a[39m 
+    [31mffffffff817859de[39m 
+[33m134[39m          {
+[33m135[39m [31mffffffff81780bce[39m 	if (!d_mountpoint(dentry))
+    [31mffffffff81780bef[39m 
+    [31mffffffff81780bfc[39m 
+    [31mffffffff81781b41[39m 
+    [31mffffffff81781b63[39m 
+    [31mffffffff81781b6b[39m 
+    [31mffffffff8178544a[39m 
+    [31mffffffff81785470[39m 
+    [31mffffffff817859de[39m 
+    [31mffffffff81785a04[39m 
+[33m136[39m          		return false;
+[33m137[39m          
+[33m138[39m [31mffffffff81780d22[39m 	return __is_local_mountpoint(dentry);
+    [31mffffffff81780d22[39m 
+    [31mffffffff81780d2f[39m 
+    [31mffffffff81781b91[39m 
+    [31mffffffff81781b91[39m 
+    [31mffffffff81781b9e[39m 
+    [31mffffffff8178547e[39m 
+    [31mffffffff8178547e[39m 
+    [31mffffffff8178548b[39m 
+    [31mffffffff81785a0d[39m 
+    [31mffffffff81785a0d[39m 
+    [31mffffffff81785a1a[39m 
+[33m139[39m          }
+[33m140[39m          
+[33m141[39m [31mffffffff817d4421[39m static inline bool is_anon_ns(struct mnt_namespace *ns)
+    [31mffffffff817d464e[39m 
+    [31mffffffff817d94ed[39m 
+    [31mffffffff817d9569[39m 
+    [31mffffffff817d99d9[39m 
+    [31mffffffff817dc3f8[39m 
+    [31mffffffff817dc993[39m 
+    [31mffffffff817e0e03[39m 
+    [31mffffffff817e37bc[39m 
+    [31mffffffff817e3d06[39m 
+    [31mffffffff8180da41[39m 
+    [31mffffffff8180dca8[39m 
+    [31mffffffff8180f481[39m 
+    [31mffffffff8180f6a9[39m 
+    [31mffffffff8180f8ba[39m 
+    [31mffffffff81810083[39m 
+    [31mffffffff818207e0[39m 
+[33m142[39m          {
+[33m143[39m [31mffffffff817d4421[39m 	return ns->seq == 0;
+    [31mffffffff817d4421[39m 
+    [31mffffffff817d4445[39m 
+    [31mffffffff817d464e[39m 
+    [31mffffffff817d464e[39m 
+    [31mffffffff817d4664[39m 
+    [31mffffffff817d4b90[39m 
+    [31mffffffff817d4b9a[39m 
+    [31mffffffff817d4c94[39m 
+    [31mffffffff817d4c9e[39m 
+    [31mffffffff817d94ed[39m 
+    [31mffffffff817d94ed[39m 
+    [31mffffffff817d9511[39m 
+    [31mffffffff817d9569[39m 
+    [31mffffffff817d9569[39m 
+    [31mffffffff817d9584[39m 
+    [31mffffffff817d9604[39m 
+    [31mffffffff817d9611[39m 
+    [31mffffffff817d961e[39m 
+    [31mffffffff817d99d9[39m 
+    [31mffffffff817d99d9[39m 
+    [31mffffffff817d99f9[39m 
+    [31mffffffff817d9b17[39m 
+    [31mffffffff817d9b21[39m 
+    [31mffffffff817dc3f8[39m 
+    [31mffffffff817dc3f8[39m 
+    [31mffffffff817dc421[39m 
+    [31mffffffff817dc993[39m 
+    [31mffffffff817dc993[39m 
+    [31mffffffff817dc9bc[39m 
+    [31mffffffff817dceb5[39m 
+    [31mffffffff817dcebf[39m 
+    [31mffffffff817dd09f[39m 
+    [31mffffffff817dd0a9[39m 
+    [31mffffffff817e0e03[39m 
+    [31mffffffff817e0e03[39m 
+    [31mffffffff817e0e27[39m 
+    [31mffffffff817e0f68[39m 
+    [31mffffffff817e0f72[39m 
+    [31mffffffff817e37bc[39m 
+    [31mffffffff817e37bc[39m 
+    [31mffffffff817e37db[39m 
+    [31mffffffff817e387d[39m 
+    [31mffffffff817e3887[39m 
+    [31mffffffff817e3d06[39m 
+    [31mffffffff817e3d06[39m 
+    [31mffffffff817e3d2a[39m 
+    [31mffffffff817e3f56[39m 
+    [31mffffffff817e3f60[39m 
+    [31mffffffff8180da41[39m 
+    [31mffffffff8180da41[39m 
+    [31mffffffff8180da65[39m 
+    [31mffffffff8180dbe7[39m 
+    [31mffffffff8180dbf1[39m 
+    [31mffffffff8180dca8[39m 
+    [31mffffffff8180dca8[39m 
+    [31mffffffff8180dcc2[39m 
+    [31mffffffff8180def1[39m 
+    [31mffffffff8180f481[39m 
+    [31mffffffff8180f481[39m 
+    [31mffffffff8180f49b[39m 
+    [31mffffffff8180f6a9[39m 
+    [31mffffffff8180f6a9[39m 
+    [31mffffffff8180f6c3[39m 
+    [31mffffffff8180f784[39m 
+    [31mffffffff8180f78e[39m 
+    [31mffffffff8180f798[39m 
+    [31mffffffff8180f8ba[39m 
+    [31mffffffff8180f8ba[39m 
+    [31mffffffff8180f8de[39m 
+    [31mffffffff8180fa2a[39m 
+    [31mffffffff8180fa34[39m 
+    [31mffffffff81810083[39m 
+    [31mffffffff81810083[39m 
+    [31mffffffff8181009e[39m 
+    [31mffffffff8181110b[39m 
+    [31mffffffff81811115[39m 
+    [31mffffffff818207e0[39m 
+    [31mffffffff818207e0[39m 
+    [31mffffffff818207fb[39m 
+    [31mffffffff818209f7[39m 
+    [31mffffffff81820a01[39m 
+[33m144[39m          }
+[33m145[39m          
+[33m146[39m [31mffffffff817cd439[39m static inline void move_from_ns(struct mount *mnt, struct list_head *dt_list)
+    [31mffffffff817daea7[39m 
+    [31mffffffff818106f9[39m 
+    [31mffffffff81810dbd[39m 
+[33m147[39m          {
+[33m148[39m [31mffffffff817cd439[39m 	WARN_ON(!(mnt->mnt.mnt_flags & MNT_ONRB));
+    [31mffffffff817cd439[39m 
+    [31mffffffff817cd439[39m 
+    [31mffffffff817cd439[39m 
+    [31mffffffff817cd439[39m 
+    [31mffffffff817dae51[39m 
+    [31mffffffff817daea7[39m 
+    [31mffffffff817daea7[39m 
+    [31mffffffff817daebf[39m 
+    [31mffffffff817daecc[39m 
+    [31mffffffff817daed8[39m 
+    [31mffffffff817daee1[39m 
+    [31mffffffff817daee1[39m 
+    [31mffffffff817db3ca[39m 
+    [31mffffffff817db3ca[39m 
+    [31mffffffff817db3ca[39m 
+    [31mffffffff817db3cf[39m 
+    [31mffffffff817db3d0[39m 
+    [31mffffffff817db3d0[39m 
+    [31mffffffff817db3d2[39m 
+    [31mffffffff817db3d2[39m 
+    [31mffffffff817db3e1[39m 
+    [31mffffffff817db6ea[39m 
+    [31mffffffff817db6fe[39m 
+    [31mffffffff818106e7[39m 
+    [31mffffffff818106f9[39m 
+    [31mffffffff818106f9[39m 
+    [31mffffffff818106f9[39m 
+    [31mffffffff81810706[39m 
+    [31mffffffff81810706[39m 
+    [31mffffffff81810adf[39m 
+    [31mffffffff81810adf[39m 
+    [31mffffffff81810adf[39m 
+    [31mffffffff81810ae5[39m 
+    [31mffffffff81810ae5[39m 
+    [31mffffffff81810ae7[39m 
+    [31mffffffff81810ae7[39m 
+    [31mffffffff81810aed[39m 
+    [31mffffffff81810dbd[39m 
+    [31mffffffff81810dbd[39m 
+    [31mffffffff81810dc0[39m 
+    [31mffffffff81810dcc[39m 
+    [31mffffffff81810dcc[39m 
+    [31mffffffff81810eb5[39m 
+    [31mffffffff81810eb5[39m 
+    [31mffffffff81810eb5[39m 
+    [31mffffffff81810ebb[39m 
+    [31mffffffff81810ebb[39m 
+    [31mffffffff81810ebd[39m 
+    [31mffffffff81810ebd[39m 
+    [31mffffffff81810ec3[39m 
+[33m149[39m [31mffffffff817cd439[39m 	mnt->mnt.mnt_flags &= ~MNT_ONRB;
+    [31mffffffff817cd43e[39m 
+    [31mffffffff817cd448[39m 
+    [31mffffffff817daee1[39m 
+    [31mffffffff817daee1[39m 
+    [31mffffffff817daf12[39m 
+    [31mffffffff817db75d[39m 
+    [31mffffffff817db76b[39m 
+    [31mffffffff81810706[39m 
+    [31mffffffff81810706[39m 
+    [31mffffffff81810733[39m 
+    [31mffffffff81810dcc[39m 
+    [31mffffffff81810dcc[39m 
+    [31mffffffff81810ddc[39m 
+    [31mffffffff81810df8[39m 
+    [31mffffffff81811015[39m 
+    [31mffffffff8181102a[39m 
+    [31mffffffff818110b8[39m 
+    [31mffffffff818110c7[39m 
+[33m150[39m [31mffffffff817cd418[39m 	rb_erase(&mnt->mnt_node, &mnt->mnt_ns->mounts);
+    [31mffffffff817cd441[39m 
+    [31mffffffff817cd456[39m 
+    [31mffffffff817cd456[39m 
+    [31mffffffff817cd467[39m 
+    [31mffffffff817cdd43[39m 
+    [31mffffffff817dae79[39m 
+    [31mffffffff817daea7[39m 
+    [31mffffffff817daf0d[39m 
+    [31mffffffff817daf16[39m 
+    [31mffffffff817db6ad[39m 
+    [31mffffffff817db6bc[39m 
+    [31mffffffff8181072c[39m 
+    [31mffffffff81810737[39m 
+    [31mffffffff81810737[39m 
+    [31mffffffff81810749[39m 
+    [31mffffffff81810df1[39m 
+    [31mffffffff81810dfb[39m 
+    [31mffffffff81810dfb[39m 
+    [31mffffffff81810e0d[39m 
+    [31mffffffff8181100b[39m 
+    [31mffffffff8181130a[39m 
+[33m151[39m [31mffffffff817cd47a[39m 	list_add_tail(&mnt->mnt_list, dt_list);
+    [31mffffffff817daf2e[39m 
+    [31mffffffff81810763[39m 
+    [31mffffffff81810e27[39m 
+[33m152[39m [31mffffffff817cd4cf[39m }
+    [31mffffffff817cd4d4[39m 
+[33m153[39m          
+[33m154[39m          extern void mnt_cursor_del(struct mnt_namespace *ns, struct mount *cursor);

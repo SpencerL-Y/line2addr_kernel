@@ -1,0 +1,830 @@
+  1          /* SPDX-License-Identifier: GPL-2.0 */
+  2          #include <linux/mount.h>
+  3          #include <linux/seq_file.h>
+  4          #include <linux/poll.h>
+  5          #include <linux/ns_common.h>
+  6          #include <linux/fs_pin.h>
+  7          
+  8          struct mnt_namespace {
+  9          	struct ns_common	ns;
+ 10          	struct mount *	root;
+ 11          	struct rb_root		mounts; /* Protected by namespace_sem */
+ 12          	struct user_namespace	*user_ns;
+ 13          	struct ucounts		*ucounts;
+ 14          	u64			seq;	/* Sequence number to prevent loops */
+ 15          	wait_queue_head_t poll;
+ 16          	u64 event;
+ 17          	unsigned int		nr_mounts; /* # of mounts in the namespace */
+ 18          	unsigned int		pending_mounts;
+ 19          } __randomize_layout;
+ 20          
+ 21          struct mnt_pcp {
+ 22          	int mnt_count;
+ 23          	int mnt_writers;
+ 24          };
+ 25          
+ 26          struct mountpoint {
+ 27          	struct hlist_node m_hash;
+ 28          	struct dentry *m_dentry;
+ 29          	struct hlist_head m_list;
+ 30          	int m_count;
+ 31          };
+ 32          
+ 33          struct mount {
+ 34          	struct hlist_node mnt_hash;
+ 35          	struct mount *mnt_parent;
+ 36          	struct dentry *mnt_mountpoint;
+ 37          	struct vfsmount mnt;
+ 38          	union {
+ 39          		struct rcu_head mnt_rcu;
+ 40          		struct llist_node mnt_llist;
+ 41          	};
+ 42          #ifdef CONFIG_SMP
+ 43          	struct mnt_pcp __percpu *mnt_pcp;
+ 44          #else
+ 45          	int mnt_count;
+ 46          	int mnt_writers;
+ 47          #endif
+ 48          	struct list_head mnt_mounts;	/* list of children, anchored here */
+ 49          	struct list_head mnt_child;	/* and going through their mnt_child */
+ 50          	struct list_head mnt_instance;	/* mount instance on sb->s_mounts */
+ 51          	const char *mnt_devname;	/* Name of device e.g. /dev/dsk/hda1 */
+ 52          	union {
+ 53          		struct rb_node mnt_node;	/* Under ns->mounts */
+ 54          		struct list_head mnt_list;
+ 55          	};
+ 56          	struct list_head mnt_expire;	/* link in fs-specific expiry list */
+ 57          	struct list_head mnt_share;	/* circular list of shared mounts */
+ 58          	struct list_head mnt_slave_list;/* list of slave mounts */
+ 59          	struct list_head mnt_slave;	/* slave list entry */
+ 60          	struct mount *mnt_master;	/* slave is on master->mnt_slave_list */
+ 61          	struct mnt_namespace *mnt_ns;	/* containing namespace */
+ 62          	struct mountpoint *mnt_mp;	/* where is it mounted */
+ 63          	union {
+ 64          		struct hlist_node mnt_mp_list;	/* list mounts with the same mountpoint */
+ 65          		struct hlist_node mnt_umount;
+ 66          	};
+ 67          	struct list_head mnt_umounting; /* list entry for umount propagation */
+ 68          #ifdef CONFIG_FSNOTIFY
+ 69          	struct fsnotify_mark_connector __rcu *mnt_fsnotify_marks;
+ 70          	__u32 mnt_fsnotify_mask;
+ 71          #endif
+ 72          	int mnt_id;			/* mount identifier, reused */
+ 73          	u64 mnt_id_unique;		/* mount ID unique until reboot */
+ 74          	int mnt_group_id;		/* peer group identifier */
+ 75          	int mnt_expiry_mark;		/* true if marked for expiry */
+ 76          	struct hlist_head mnt_pins;
+ 77          	struct hlist_head mnt_stuck_children;
+ 78          } __randomize_layout;
+ 79          
+ 80          #define MNT_NS_INTERNAL ERR_PTR(-EINVAL) /* distinct from any mnt_namespace */
+ 81          
+ 82 ffffffff817799e0 static inline struct mount *real_mount(struct vfsmount *mnt)
+    ffffffff8178acfb 
+    ffffffff8178aef4 
+    ffffffff817ce2fc 
+    ffffffff817ce633 
+    ffffffff817d0079 
+    ffffffff817d075e 
+    ffffffff817d0e05 
+    ffffffff817d1c1f 
+    ffffffff817d2b03 
+    ffffffff817d2c3f 
+    ffffffff817d3244 
+    ffffffff817d4197 
+    ffffffff817d4cf1 
+    ffffffff817d5c64 
+    ffffffff817d6fee 
+    ffffffff817d748a 
+    ffffffff817d8fc1 
+    ffffffff817d9401 
+    ffffffff817d953e 
+    ffffffff817d98ac 
+    ffffffff817da077 
+    ffffffff817da3bc 
+    ffffffff817dbb77 
+    ffffffff817dbeae 
+    ffffffff817dbed5 
+    ffffffff817dc6e9 
+    ffffffff817de448 
+    ffffffff817df421 
+    ffffffff817df5bf 
+    ffffffff817df75d 
+    ffffffff817dfcb6 
+    ffffffff817e0135 
+    ffffffff817e0ad0 
+    ffffffff817e0b43 
+    ffffffff817e1e82 
+    ffffffff817e1e8e 
+    ffffffff817e1eb2 
+    ffffffff817e3909 
+    ffffffff817e3a60 
+    ffffffff85efd645 
+    ffffffff818202e5 
+    ffffffff818443ea 
+ 83          {
+ 84 ffffffff817799e0 	return container_of(mnt, struct mount, mnt);
+    ffffffff817799e0 
+    ffffffff817799e0 
+    ffffffff817799e0 
+    ffffffff817799fa 
+    ffffffff817799fe 
+    ffffffff8178acfb 
+    ffffffff8178acfb 
+    ffffffff8178acfb 
+    ffffffff8178acfb 
+    ffffffff8178ad05 
+    ffffffff8178aef4 
+    ffffffff8178aef4 
+    ffffffff8178aef4 
+    ffffffff8178aef4 
+    ffffffff8178aef4 
+    ffffffff8178aef9 
+    ffffffff817ce2fc 
+    ffffffff817ce2fc 
+    ffffffff817ce2fc 
+    ffffffff817ce2fc 
+    ffffffff817ce2fc 
+    ffffffff817ce301 
+    ffffffff817ce633 
+    ffffffff817ce633 
+    ffffffff817ce633 
+    ffffffff817ce633 
+    ffffffff817ce63b 
+    ffffffff817ce63f 
+    ffffffff817d0079 
+    ffffffff817d0079 
+    ffffffff817d0079 
+    ffffffff817d0079 
+    ffffffff817d0079 
+    ffffffff817d0279 
+    ffffffff817d075e 
+    ffffffff817d075e 
+    ffffffff817d075e 
+    ffffffff817d075e 
+    ffffffff817d076b 
+    ffffffff817d076f 
+    ffffffff817d0e05 
+    ffffffff817d0e05 
+    ffffffff817d0e05 
+    ffffffff817d0e05 
+    ffffffff817d0e05 
+    ffffffff817d0e76 
+    ffffffff817d1c1f 
+    ffffffff817d1c1f 
+    ffffffff817d1c1f 
+    ffffffff817d1c1f 
+    ffffffff817d1c28 
+    ffffffff817d2b03 
+    ffffffff817d2b03 
+    ffffffff817d2b03 
+    ffffffff817d2b03 
+    ffffffff817d2b0f 
+    ffffffff817d2b13 
+    ffffffff817d2c3f 
+    ffffffff817d2c3f 
+    ffffffff817d2c3f 
+    ffffffff817d2c3f 
+    ffffffff817d2c4b 
+    ffffffff817d2c4f 
+    ffffffff817d323b 
+    ffffffff817d3244 
+    ffffffff817d3244 
+    ffffffff817d3244 
+    ffffffff817d3244 
+    ffffffff817d3244 
+    ffffffff817d4197 
+    ffffffff817d4197 
+    ffffffff817d4197 
+    ffffffff817d4197 
+    ffffffff817d41a7 
+    ffffffff817d41ac 
+    ffffffff817d4cf1 
+    ffffffff817d4cf1 
+    ffffffff817d4cf1 
+    ffffffff817d4cf1 
+    ffffffff817d4cf5 
+    ffffffff817d4cfa 
+    ffffffff817d5c64 
+    ffffffff817d5c64 
+    ffffffff817d5c64 
+    ffffffff817d5c64 
+    ffffffff817d5c71 
+    ffffffff817d5c76 
+    ffffffff817d6fee 
+    ffffffff817d6fee 
+    ffffffff817d6fee 
+    ffffffff817d6fee 
+    ffffffff817d6fee 
+    ffffffff817d6ff7 
+    ffffffff817d748a 
+    ffffffff817d748a 
+    ffffffff817d748a 
+    ffffffff817d748a 
+    ffffffff817d748e 
+    ffffffff817d7492 
+    ffffffff817d7496 
+    ffffffff817d7ba9 
+    ffffffff817d7bad 
+    ffffffff817d7cf0 
+    ffffffff817d7cf3 
+    ffffffff817d8fc1 
+    ffffffff817d8fc1 
+    ffffffff817d8fc1 
+    ffffffff817d8fc1 
+    ffffffff817d8fc1 
+    ffffffff817d90c4 
+    ffffffff817d9401 
+    ffffffff817d9401 
+    ffffffff817d9401 
+    ffffffff817d9401 
+    ffffffff817d9401 
+    ffffffff817d9405 
+    ffffffff817d953e 
+    ffffffff817d953e 
+    ffffffff817d953e 
+    ffffffff817d953e 
+    ffffffff817d9543 
+    ffffffff817d98ac 
+    ffffffff817d98ac 
+    ffffffff817d98ac 
+    ffffffff817d98ac 
+    ffffffff817d98b8 
+    ffffffff817d98bc 
+    ffffffff817da077 
+    ffffffff817da077 
+    ffffffff817da077 
+    ffffffff817da077 
+    ffffffff817da07c 
+    ffffffff817da084 
+    ffffffff817da08d 
+    ffffffff817da3bc 
+    ffffffff817da3bc 
+    ffffffff817da3bc 
+    ffffffff817da3bc 
+    ffffffff817da3bc 
+    ffffffff817da3be 
+    ffffffff817dbb77 
+    ffffffff817dbb77 
+    ffffffff817dbb77 
+    ffffffff817dbb77 
+    ffffffff817dbb8a 
+    ffffffff817dbb8e 
+    ffffffff817dbeae 
+    ffffffff817dbeae 
+    ffffffff817dbeae 
+    ffffffff817dbeae 
+    ffffffff817dbeae 
+    ffffffff817dbed5 
+    ffffffff817dbed5 
+    ffffffff817dbed5 
+    ffffffff817dbed5 
+    ffffffff817dbed5 
+    ffffffff817dc0cc 
+    ffffffff817dc0da 
+    ffffffff817dc307 
+    ffffffff817dc315 
+    ffffffff817dc6e9 
+    ffffffff817dc6e9 
+    ffffffff817dc6e9 
+    ffffffff817dc6e9 
+    ffffffff817dc6e9 
+    ffffffff817dc6f9 
+    ffffffff817dcc54 
+    ffffffff817dcc5b 
+    ffffffff817de448 
+    ffffffff817de448 
+    ffffffff817de448 
+    ffffffff817de448 
+    ffffffff817de451 
+    ffffffff817df421 
+    ffffffff817df421 
+    ffffffff817df421 
+    ffffffff817df421 
+    ffffffff817df421 
+    ffffffff817df5bf 
+    ffffffff817df5bf 
+    ffffffff817df5bf 
+    ffffffff817df5bf 
+    ffffffff817df5bf 
+    ffffffff817df75d 
+    ffffffff817df75d 
+    ffffffff817df75d 
+    ffffffff817df75d 
+    ffffffff817df75d 
+    ffffffff817dfa5d 
+    ffffffff817dfa6f 
+    ffffffff817dfa73 
+    ffffffff817dfcb6 
+    ffffffff817dfcb6 
+    ffffffff817dfcb6 
+    ffffffff817dfcb6 
+    ffffffff817dfcba 
+    ffffffff817dff41 
+    ffffffff817e00b7 
+    ffffffff817e00bc 
+    ffffffff817e0135 
+    ffffffff817e0135 
+    ffffffff817e0135 
+    ffffffff817e0135 
+    ffffffff817e0141 
+    ffffffff817e0145 
+    ffffffff817e0ad0 
+    ffffffff817e0ad0 
+    ffffffff817e0ad0 
+    ffffffff817e0ad0 
+    ffffffff817e0adc 
+    ffffffff817e0ae0 
+    ffffffff817e0b43 
+    ffffffff817e0b43 
+    ffffffff817e0b43 
+    ffffffff817e0b43 
+    ffffffff817e0b4f 
+    ffffffff817e0b53 
+    ffffffff817e1e82 
+    ffffffff817e1e82 
+    ffffffff817e1e82 
+    ffffffff817e1e82 
+    ffffffff817e1e82 
+    ffffffff817e1e8e 
+    ffffffff817e1e8e 
+    ffffffff817e1e8e 
+    ffffffff817e1e8e 
+    ffffffff817e1e8e 
+    ffffffff817e1eb2 
+    ffffffff817e1eb2 
+    ffffffff817e1eb2 
+    ffffffff817e1eb2 
+    ffffffff817e1eb2 
+    ffffffff817e215e 
+    ffffffff817e217f 
+    ffffffff817e2188 
+    ffffffff817e38be 
+    ffffffff817e3909 
+    ffffffff817e3909 
+    ffffffff817e3909 
+    ffffffff817e3909 
+    ffffffff817e390e 
+    ffffffff817e3a60 
+    ffffffff817e3a60 
+    ffffffff817e3a60 
+    ffffffff817e3a60 
+    ffffffff817e3a6d 
+    ffffffff817e3a72 
+    ffffffff85efd645 
+    ffffffff85efd645 
+    ffffffff85efd645 
+    ffffffff85efd645 
+    ffffffff85efd64a 
+    ffffffff85efd64e 
+    ffffffff85efd652 
+    ffffffff818202e5 
+    ffffffff818202e5 
+    ffffffff818202e5 
+    ffffffff818202e5 
+    ffffffff818202f6 
+    ffffffff818443ea 
+    ffffffff818443ea 
+    ffffffff818443ea 
+    ffffffff818443ea 
+    ffffffff818443ea 
+    ffffffff818446b1 
+ 85          }
+ 86          
+ 87 ffffffff817792b3 static inline int mnt_has_parent(struct mount *mnt)
+    ffffffff817cd815 
+    ffffffff817cd9e5 
+    ffffffff817cd9f4 
+    ffffffff817ce66a 
+    ffffffff817d07b1 
+    ffffffff817d1c55 
+    ffffffff817d1d52 
+    ffffffff817d42f7 
+    ffffffff817dc6a2 
+    ffffffff817dcc6c 
+    ffffffff817e1af0 
+ 88          {
+ 89 ffffffff8177926b 	return mnt != mnt->mnt_parent;
+    ffffffff817792b3 
+    ffffffff817792b3 
+    ffffffff817792cd 
+    ffffffff817792d1 
+    ffffffff81779472 
+    ffffffff8177947c 
+    ffffffff817cd7be 
+    ffffffff817cd7ca 
+    ffffffff817cd7e0 
+    ffffffff817cd7e4 
+    ffffffff817cd815 
+    ffffffff817cd815 
+    ffffffff817cd9e5 
+    ffffffff817cd9e5 
+    ffffffff817cd9f4 
+    ffffffff817cd9f4 
+    ffffffff817cdbeb 
+    ffffffff817cdbf8 
+    ffffffff817ce645 
+    ffffffff817ce66a 
+    ffffffff817ce66a 
+    ffffffff817ce685 
+    ffffffff817ce689 
+    ffffffff817ce709 
+    ffffffff817ce713 
+    ffffffff817d0788 
+    ffffffff817d07b1 
+    ffffffff817d07b1 
+    ffffffff817d07cc 
+    ffffffff817d07d0 
+    ffffffff817d163b 
+    ffffffff817d1645 
+    ffffffff817d1c28 
+    ffffffff817d1c55 
+    ffffffff817d1c55 
+    ffffffff817d1c70 
+    ffffffff817d1c74 
+    ffffffff817d1d52 
+    ffffffff817d1d52 
+    ffffffff817d1d6d 
+    ffffffff817d1d71 
+    ffffffff817d20b4 
+    ffffffff817d20be 
+    ffffffff817d20db 
+    ffffffff817d20e5 
+    ffffffff817d42f7 
+    ffffffff817d42f7 
+    ffffffff817d4320 
+    ffffffff817d4c9e 
+    ffffffff817d4ca8 
+    ffffffff817dc685 
+    ffffffff817dc691 
+    ffffffff817dc6a2 
+    ffffffff817dc6a2 
+    ffffffff817dc6c0 
+    ffffffff817dcc6c 
+    ffffffff817dcc6c 
+    ffffffff817dcc96 
+    ffffffff817dcf10 
+    ffffffff817dcf1a 
+    ffffffff817dcf3e 
+    ffffffff817dcf48 
+    ffffffff817e1acb 
+    ffffffff817e1af0 
+    ffffffff817e1af0 
+    ffffffff817e1b07 
+    ffffffff817e1b0b 
+    ffffffff817e1b7f 
+    ffffffff817e1b86 
+ 90          }
+ 91          
+ 92 ffffffff817cbc0d static inline int is_mounted(struct vfsmount *mnt)
+    ffffffff817d42a5 
+    ffffffff817d5f34 
+    ffffffff817dc0a7 
+    ffffffff817dd320 
+    ffffffff817dd368 
+ 93          {
+ 94          	/* neither detached nor internal? */
+ 95 ffffffff817cbbff 	return !IS_ERR_OR_NULL(real_mount(mnt)->mnt_ns);
+    ffffffff817cbc0d 
+    ffffffff817cbc0d 
+    ffffffff817cbc28 
+    ffffffff817cbd51 
+    ffffffff817cbd5b 
+    ffffffff817d42a5 
+    ffffffff817d42a5 
+    ffffffff817d4c71 
+    ffffffff817d4c80 
+    ffffffff817d5f34 
+    ffffffff817d5f34 
+    ffffffff817d5f4e 
+    ffffffff817d6150 
+    ffffffff817d615a 
+    ffffffff817dc0a7 
+    ffffffff817dd320 
+    ffffffff817dd320 
+    ffffffff817dd368 
+    ffffffff817dd368 
+    ffffffff817dd374 
+    ffffffff817dd38f 
+    ffffffff817ddaba 
+    ffffffff817ddac7 
+    ffffffff817ddad1 
+ 96          }
+ 97          
+ 98          extern struct mount *__lookup_mnt(struct vfsmount *, struct dentry *);
+ 99          
+100          extern int __legitimize_mnt(struct vfsmount *, unsigned);
+101          
+102 ffffffff817ab7ff static inline bool __path_is_mountpoint(const struct path *path)
+    ffffffff817d5a9a 
+103          {
+104 ffffffff817ab7ff 	struct mount *m = __lookup_mnt(path->mnt, path->dentry);
+    ffffffff817ab7ff 
+    ffffffff817d5a9a 
+    ffffffff817d5a9a 
+105 ffffffff817ab812 	return m && likely(!(m->mnt.mnt_flags & MNT_SYNC_UMOUNT));
+    ffffffff817ab812 
+    ffffffff817ab817 
+    ffffffff817ab81c 
+    ffffffff817ab842 
+    ffffffff817ab848 
+    ffffffff817d5aa9 
+    ffffffff817d5aa9 
+    ffffffff817d5ab3 
+    ffffffff817d5ab8 
+    ffffffff817d5ad6 
+    ffffffff817d5ae6 
+    ffffffff817d5b3d 
+106          }
+107          
+108          extern void __detach_mounts(struct dentry *dentry);
+109          
+110 ffffffff81780e3b static inline void detach_mounts(struct dentry *dentry)
+    ffffffff81781d57 
+    ffffffff81785e87 
+    ffffffff817b1ff0 
+111          {
+112 ffffffff81780e3b 	if (!d_mountpoint(dentry))
+    ffffffff81780e60 
+    ffffffff81780e6d 
+    ffffffff81781d57 
+    ffffffff81781d78 
+    ffffffff81781d84 
+    ffffffff81785e87 
+    ffffffff81785ea9 
+    ffffffff817b1ff0 
+    ffffffff817b200d 
+113          		return;
+114 ffffffff81780fde 	__detach_mounts(dentry);
+    ffffffff81780feb 
+    ffffffff8178218d 
+    ffffffff8178219a 
+    ffffffff81785eb2 
+    ffffffff81785ebf 
+    ffffffff817b2016 
+115          }
+116          
+117 ffffffff817cdfcc static inline void get_mnt_ns(struct mnt_namespace *ns)
+    ffffffff817e0687 
+    ffffffff817e3d66 
+    ffffffff85efd6f0 
+    ffffffff8184548d 
+118          {
+119 ffffffff817cdfcc 	refcount_inc(&ns->ns.count);
+    ffffffff817cdfd6 
+    ffffffff817e0687 
+    ffffffff817e3d66 
+    ffffffff85efd6f0 
+    ffffffff8184548d 
+    ffffffff818454a4 
+120          }
+121          
+122          extern seqlock_t mount_lock;
+123          
+124          struct proc_mounts {
+125          	struct mnt_namespace *ns;
+126          	struct path root;
+127          	int (*show)(struct seq_file *, struct vfsmount *);
+128          };
+129          
+130          extern const struct seq_operations mounts_op;
+131          
+132          extern bool __is_local_mountpoint(struct dentry *dentry);
+133 ffffffff81780bce static inline bool is_local_mountpoint(struct dentry *dentry)
+    ffffffff81781b41 
+    ffffffff8178544a 
+    ffffffff817859de 
+134          {
+135 ffffffff81780bce 	if (!d_mountpoint(dentry))
+    ffffffff81780bef 
+    ffffffff81780bfc 
+    ffffffff81781b41 
+    ffffffff81781b63 
+    ffffffff81781b6b 
+    ffffffff8178544a 
+    ffffffff81785470 
+    ffffffff817859de 
+    ffffffff81785a04 
+136          		return false;
+137          
+138 ffffffff81780d22 	return __is_local_mountpoint(dentry);
+    ffffffff81780d22 
+    ffffffff81780d2f 
+    ffffffff81781b91 
+    ffffffff81781b91 
+    ffffffff81781b9e 
+    ffffffff8178547e 
+    ffffffff8178547e 
+    ffffffff8178548b 
+    ffffffff81785a0d 
+    ffffffff81785a0d 
+    ffffffff81785a1a 
+139          }
+140          
+141 ffffffff817d4421 static inline bool is_anon_ns(struct mnt_namespace *ns)
+    ffffffff817d464e 
+    ffffffff817d94ed 
+    ffffffff817d9569 
+    ffffffff817d99d9 
+    ffffffff817dc3f8 
+    ffffffff817dc993 
+    ffffffff817e0e03 
+    ffffffff817e37bc 
+    ffffffff817e3d06 
+    ffffffff8180da41 
+    ffffffff8180dca8 
+    ffffffff8180f481 
+    ffffffff8180f6a9 
+    ffffffff8180f8ba 
+    ffffffff81810083 
+    ffffffff818207e0 
+142          {
+143 ffffffff817d4421 	return ns->seq == 0;
+    ffffffff817d4421 
+    ffffffff817d4445 
+    ffffffff817d464e 
+    ffffffff817d464e 
+    ffffffff817d4664 
+    ffffffff817d4b90 
+    ffffffff817d4b9a 
+    ffffffff817d4c94 
+    ffffffff817d4c9e 
+    ffffffff817d94ed 
+    ffffffff817d94ed 
+    ffffffff817d9511 
+    ffffffff817d9569 
+    ffffffff817d9569 
+    ffffffff817d9584 
+    ffffffff817d9604 
+    ffffffff817d9611 
+    ffffffff817d961e 
+    ffffffff817d99d9 
+    ffffffff817d99d9 
+    ffffffff817d99f9 
+    ffffffff817d9b17 
+    ffffffff817d9b21 
+    ffffffff817dc3f8 
+    ffffffff817dc3f8 
+    ffffffff817dc421 
+    ffffffff817dc993 
+    ffffffff817dc993 
+    ffffffff817dc9bc 
+    ffffffff817dceb5 
+    ffffffff817dcebf 
+    ffffffff817dd09f 
+    ffffffff817dd0a9 
+    ffffffff817e0e03 
+    ffffffff817e0e03 
+    ffffffff817e0e27 
+    ffffffff817e0f68 
+    ffffffff817e0f72 
+    ffffffff817e37bc 
+    ffffffff817e37bc 
+    ffffffff817e37db 
+    ffffffff817e387d 
+    ffffffff817e3887 
+    ffffffff817e3d06 
+    ffffffff817e3d06 
+    ffffffff817e3d2a 
+    ffffffff817e3f56 
+    ffffffff817e3f60 
+    ffffffff8180da41 
+    ffffffff8180da41 
+    ffffffff8180da65 
+    ffffffff8180dbe7 
+    ffffffff8180dbf1 
+    ffffffff8180dca8 
+    ffffffff8180dca8 
+    ffffffff8180dcc2 
+    ffffffff8180def1 
+    ffffffff8180f481 
+    ffffffff8180f481 
+    ffffffff8180f49b 
+    ffffffff8180f6a9 
+    ffffffff8180f6a9 
+    ffffffff8180f6c3 
+    ffffffff8180f784 
+    ffffffff8180f78e 
+    ffffffff8180f798 
+    ffffffff8180f8ba 
+    ffffffff8180f8ba 
+    ffffffff8180f8de 
+    ffffffff8180fa2a 
+    ffffffff8180fa34 
+    ffffffff81810083 
+    ffffffff81810083 
+    ffffffff8181009e 
+    ffffffff8181110b 
+    ffffffff81811115 
+    ffffffff818207e0 
+    ffffffff818207e0 
+    ffffffff818207fb 
+    ffffffff818209f7 
+    ffffffff81820a01 
+144          }
+145          
+146 ffffffff817cd439 static inline void move_from_ns(struct mount *mnt, struct list_head *dt_list)
+    ffffffff817daea7 
+    ffffffff818106f9 
+    ffffffff81810dbd 
+147          {
+148 ffffffff817cd439 	WARN_ON(!(mnt->mnt.mnt_flags & MNT_ONRB));
+    ffffffff817cd439 
+    ffffffff817cd439 
+    ffffffff817cd439 
+    ffffffff817cd439 
+    ffffffff817dae51 
+    ffffffff817daea7 
+    ffffffff817daea7 
+    ffffffff817daebf 
+    ffffffff817daecc 
+    ffffffff817daed8 
+    ffffffff817daee1 
+    ffffffff817daee1 
+    ffffffff817db3ca 
+    ffffffff817db3ca 
+    ffffffff817db3ca 
+    ffffffff817db3cf 
+    ffffffff817db3d0 
+    ffffffff817db3d0 
+    ffffffff817db3d2 
+    ffffffff817db3d2 
+    ffffffff817db3e1 
+    ffffffff817db6ea 
+    ffffffff817db6fe 
+    ffffffff818106e7 
+    ffffffff818106f9 
+    ffffffff818106f9 
+    ffffffff818106f9 
+    ffffffff81810706 
+    ffffffff81810706 
+    ffffffff81810adf 
+    ffffffff81810adf 
+    ffffffff81810adf 
+    ffffffff81810ae5 
+    ffffffff81810ae5 
+    ffffffff81810ae7 
+    ffffffff81810ae7 
+    ffffffff81810aed 
+    ffffffff81810dbd 
+    ffffffff81810dbd 
+    ffffffff81810dc0 
+    ffffffff81810dcc 
+    ffffffff81810dcc 
+    ffffffff81810eb5 
+    ffffffff81810eb5 
+    ffffffff81810eb5 
+    ffffffff81810ebb 
+    ffffffff81810ebb 
+    ffffffff81810ebd 
+    ffffffff81810ebd 
+    ffffffff81810ec3 
+149 ffffffff817cd439 	mnt->mnt.mnt_flags &= ~MNT_ONRB;
+    ffffffff817cd43e 
+    ffffffff817cd448 
+    ffffffff817daee1 
+    ffffffff817daee1 
+    ffffffff817daf12 
+    ffffffff817db75d 
+    ffffffff817db76b 
+    ffffffff81810706 
+    ffffffff81810706 
+    ffffffff81810733 
+    ffffffff81810dcc 
+    ffffffff81810dcc 
+    ffffffff81810ddc 
+    ffffffff81810df8 
+    ffffffff81811015 
+    ffffffff8181102a 
+    ffffffff818110b8 
+    ffffffff818110c7 
+150 ffffffff817cd418 	rb_erase(&mnt->mnt_node, &mnt->mnt_ns->mounts);
+    ffffffff817cd441 
+    ffffffff817cd456 
+    ffffffff817cd456 
+    ffffffff817cd467 
+    ffffffff817cdd43 
+    ffffffff817dae79 
+    ffffffff817daea7 
+    ffffffff817daf0d 
+    ffffffff817daf16 
+    ffffffff817db6ad 
+    ffffffff817db6bc 
+    ffffffff8181072c 
+    ffffffff81810737 
+    ffffffff81810737 
+    ffffffff81810749 
+    ffffffff81810df1 
+    ffffffff81810dfb 
+    ffffffff81810dfb 
+    ffffffff81810e0d 
+    ffffffff8181100b 
+    ffffffff8181130a 
+151 ffffffff817cd47a 	list_add_tail(&mnt->mnt_list, dt_list);
+    ffffffff817daf2e 
+    ffffffff81810763 
+    ffffffff81810e27 
+152 ffffffff817cd4cf }
+    ffffffff817cd4d4 
+153          
+154          extern void mnt_cursor_del(struct mnt_namespace *ns, struct mount *cursor);
