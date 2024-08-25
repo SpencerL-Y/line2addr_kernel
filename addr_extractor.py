@@ -5,9 +5,8 @@ sys.path.insert(0, os.path.abspath("../../"))
 from ChatAnalyzer.extract_func_body import extract_func_definition_linerange_linux_path
 from ChatAnalyzer.get_arguments import get_funcname_firstline_linux_folder
 
-# TODO: change your path here
-abspath = "/home/clexma/Desktop/fox3/fuzzing/linuxRepo"
-linux_folder = abspath
+project_root = "/home/clexma/Desktop/fox3/fuzzing/"
+linux_folder = project_root + "linuxRepo/"
 
 def process_line(line):
     # Regular expression to match the three parts
@@ -73,8 +72,8 @@ def obtain_function_addresses(line_range, file_path):
 
 
 if __name__ == "__main__":
-    # TODO: 1. obtain target function and close functions from the input
-    # TODO: 2. extract address in target functions and close functions:
+    #  1. obtain target function and close functions from the input
+    #  2. extract address in target functions and close functions:
                 # (1) determine the files of the functions
                 # (2) process the file with vmlinux and process the files
                 # (3) obtain the address from the files process
@@ -111,7 +110,6 @@ if __name__ == "__main__":
                 output_file.write(addr + "\n")
                 pure_addr_output_file.write(addr + "\n")
 
-    output_file.write("----- end\n")
         
 
         
