@@ -105,11 +105,14 @@ if __name__ == "__main__":
             output_file.write(function_name + "\n")
             output_file.write("----- filepath:\n")
             output_file.write(file_path + "\n")
+            output_file.write("----- source:\n")
+            output_file.write(item + "\n")
             output_file.write("----- addresses:\n")
             for addr in line_addr_map[item]:
                 output_file.write(addr + "\n")
                 pure_addr_output_file.write(addr + "\n")
-
+    output_file.close()
+    pure_addr_output_file.close()
         
 
         

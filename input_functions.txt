@@ -1,8 +1,3 @@
-__do_fast_syscall_32
-__ia32_sys_fsopen
-__ia32_sys_fspick
-do_int80_emulation
-do_syscall_64
-ia32_sys_call
-x64_sys_call
+fscontext_create_fd
 kpageflags_read
+stable_page_flags
